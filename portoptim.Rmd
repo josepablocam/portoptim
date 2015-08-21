@@ -56,7 +56,7 @@ We'll go ahead and create 1000 random portfolios. For each portfolio, we draw th
 
 Finally, we can take a look at the expected returns and the standard deviation on returns for each of the random portfolio. 
 
-![random_portfolios](/Users/josecambronero/Projects/spark-timeseries/src/main/resources/rand_portfolios.png)
+![random_portfolios](./figures/rand_portfolios.png)
 
 Now, note that for various risk levels, we can achieve a varying level of expected returns. As a rational investor, we'd like the largest possible return for a given risk. Or stated converseley, the smallest possible risk for a given return. Note that this is the exact definition of the efficient frontier we formulated before.
 
@@ -75,7 +75,7 @@ Given that various parts of our operation never change across different points i
 
 And here we have our result, where the red dots represent the efficient frontier at various return levels.
 
-![random_portfolios](/Users/josecambronero/Projects/spark-timeseries/src/main/resources/rand_portfolios_with_frontier.png)
+![random_portfolios](./figures/rand_portfolios_with_frontier.png)
 
  
 ## Real world example
@@ -110,7 +110,6 @@ Values won't be available for every date in our time index so we fill in any mis
 ```scala
   val filledRdd = reducedRdd.
     fill("spline").
-    fill("previous").
     fill("next")
 ```
 
@@ -121,13 +120,13 @@ The truth of the world is that it is a dirty dirty place (for data). Data is nev
 
 In our case, a quick plot of average returns per asset reveals that there is a clear outlier that we should investigate.
 
-![avg_returns_per_asset](/Users/josecambronero/Projects/spark-timeseries/src/main/resources/avg_returns_per_asset.png)
+![avg_returns_per_asset](./figures/avg_returns_per_asset.png)
 
 Once we into the data (see the source code for details), we'll find that AMSC actually had a reverse stock split during our experiment's window. Checkout that price jump in the graph below, which shows the original (without imputation) price time series.
 
 During a [reverse stock split](https://en.wikipedia.org/wiki/Reverse_stock_split), a company takes their outstanding shares, and then issues a fraction of these back at a higher price, such that their market value (shares outstanding x price) remains constant. There are a variety of reasons for this, but we don't really care here. The fact is that this messed up our data. It is clear that in the real world, we would have to adjust our price information for all of these kind of events. In fact, this can be one of the most important parts of financial modeling. In blog world, however, we're just going to drop this series from our data set. But it is worth noting, had we not explored our data, we would have never noticed this issue! So much like the North Face motto says: *Never Stop Exploring*!
 
-![AMSC_raw_prices](/Users/josecambronero/Projects/spark-timeseries/src/main/resources/AMSC_raw_prices.png)
+![AMSC_raw_prices](./figures/AMSC_raw_prices.png)
 
 
 ## Our frontier
@@ -135,6 +134,6 @@ Now that we have our data set cleaned up, we perform the same basic operations w
 
 And here is our new graph:
 
-![final_frontier](/Users/josecambronero/Projects/spark-timeseries/src/main/resources/final_frontier.png)
+![final_frontier](./figures/final_frontier.png)
 
 We hope you enjoyed exploring the funcionality of Spark timeseries.
