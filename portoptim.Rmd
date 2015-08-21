@@ -1,0 +1,140 @@
+---
+title: "Building an Efficient Frontier with Spark-Timeseries"
+author: "Jose Cambronero"
+highlight: pygments
+output: pdf_document
+---
+Cloudera's open source [Spark timeseries](https://github.com/cloudera/spark-timeseries) brings the Spark platform to the world of timeseries analytics, providing a coherent set of tools and abstractions built around the functionality (both data-munging and modeling related) that timeseries users have grown to expect from other analytic platforms. 
+
+I recently read this very nicely written and interesting [blog post](http://blog.quantopian.com/markowitz-portfolio-optimization-2/), written by the folks at [Quantopian](https://www.quantopian.com/), on calculating the efficient frontier in Python. I thought it would be a great exercise to work through a similar example, but using Spark timeseries and taking advantage of the power of distributed computing.
+
+In this blog post we explore how to leverage this tool to perform a common calculation in finance and economics: portfolio optimization. In our case, we'll explore [Harry Markowitz's Efficient Frontier](https://en.wikipedia.org/wiki/Efficient_frontier), which given a set of assets (along with information on their returns and how their returns are related to each other) allows us to create a portfolio that minimizes the risk (measured by the variance of the returns) for a given expected return level.
+
+## Efficient Frontier: Problem Formulation 
+We'll skip  most of the theory and notation, since that is not quite the point of this post and will most likely simply distract us from the functionality presented, which is our core goal. For those interested in more detail, please feel free to take a look at this [great presentation](http://www.maths.usyd.edu.au/u/alpapani/riskManagement/lecture4.pdf), which works through some of the basic calculus and linear algebra portions of the problem. 
+
+We'll describe our problem in simple terms and go from there. We have group of assets, and for each we have a time series of their returns. We want to achieve a portfolio $P$ that has an expected return $\bar{r}$, and we would like to have this portfolio with as little risk as possible. We can solve for the weights that we allocate to each asset in our group, $w_i$, so that our $P$ satisfies these conditions and our portfolio weights sum to one. This is a classic example of constrained optimization. Given the measure we are trying to minimize (risk, measured by variance), and our constraints, we can solve this using a technique called [Lagrangian multipliers](https://en.wikipedia.org/wiki/Lagrange_multiplier). Again, we'll skip the details, but the gist of it is: we can calculate derivatives of a series of equations that describe this problem and then solve the system of equations using simple matrix math (and when I say simple... I mean simple: even a lowly econ undergrad as myself can hobble through these.)
+
+## Functionality used from the Spark platform
+It is worth noting that real-world portfolio optimization is much more complex than this, and involves marketplace constraints (i.e. can you really short X shares of company Y?), more realistic functions to minimize (i.e. can we come up with a better measure of risk/loss potential? current practitioners point to measures such as [conditional value at risk](http://www.investopedia.com/terms/c/conditional_value_at_risk.asp)), and details like transaction costs etc. However, the goal of this post is not to make you an expert financier (sorry!), but to show you how to use Spark timeseries to satisfy your analytic needs (yay!). Here's an (incomplete) list of things we will make use of:
+
+- `RDD[TimeSeries]` and `TimeSeriesRDD`, the main abstraction that allows us to distribute collections of time series
+- Filtering: we need to remove series and periods in time that we don't care about
+- Value imputation: we are inherently going to have missing data. We need strategies to fill these in.
+- Conversion to Spark MLLib data types: we can convert a `TimeSeriesRDD` to various of Spark's MLlib distributed matrices. This in turn means we can take advantage of distributed implementations of covariance and mean calculation.
+
+## Simulated example
+We'll start warming up by tackling a simulated example. Simulated data can be nice to make sure the intuition is clear and the machinery needed is in place before we move on to the dirty, eh, sorry I mean real, world. For the sake of brevity, we'll exclude the definition of the functions involved in solving for the efficient frontier. However, feel free to take a look at the full code in [the repo](https://github.com/josepablocam/spark-timeseries/blob/portfolio_optim/src/main/scala/com/cloudera/finance/examples/PortfolioOptimizationExample.scala),
+
+Our first task is to create random returns for a set of assets. Our investment universe will consist of 10 assets, with normally distributed returns.
+```scala
+  val rand = new MersenneTwister(10L)
+  val nRandAssets = 10
+
+  // simulated returns
+  val sampledRets = sc.parallelize(
+      Array.fill(1000)(Vectors.dense(Array.fill(nRandAssets)(rand.nextGaussian)))
+  )
+```
+
+Nowe let's take advantage of MLlib's distributed covariance and mean calculations.
+
+```scala
+  val sampledRetMatrix = new RowMatrix(sampledRets)
+  val avgSampledRets = sparkVectortoBreeze(sampledRetMatrix.computeColumnSummaryStatistics().mean)
+  val sampledRetsCov = sparkMatrixtoBreeze(sampledRetMatrix.computeCovariance())
+```
+
+We'll go ahead and create 1000 random portfolios. For each portfolio, we draw the weights for each of the 10 assets from a uniform distribution and normalize them to sum to 1.
+
+```scala
+  // random portfolios as column matrices of weights
+  val randPortfolios = Array.fill(1000)(Array.fill(nRandAssets)(math.random)).
+    map(p => p.map(_ / p.sum)).
+    map(w => new DenseMatrix(nRandAssets, 1, w))
+```
+
+Finally, we can take a look at the expected returns and the standard deviation on returns for each of the random portfolio. 
+
+![random_portfolios](/Users/josecambronero/Projects/spark-timeseries/src/main/resources/rand_portfolios.png)
+
+Now, note that for various risk levels, we can achieve a varying level of expected returns. As a rational investor, we'd like the largest possible return for a given risk. Or stated converseley, the smallest possible risk for a given return. Note that this is the exact definition of the efficient frontier we formulated before.
+
+In the chunk below, we calculate the Markowitz efficient frontier by generating 100k uniformly spaced expected return values between the largest and smallest return from our random portfolios. In the underlying function, we create the linear system of equations and distribute solving it for each of these expected return points. This is done by mapping over an RDD consisting of the expected return values so that each system is solved locally. 
+
+Given that various parts of our operation never change across different points in the efficient frontier calculation (e.g. the covariance matrix for the returns, or the matrix used to solve the linear system), we broadcast various of these to the nodes, so that a copy is not shipped with every call. This is found in the underlying definition of `markowitzFrontier`, which you can find in the source code referenced prior.
+
+```scala
+ val randFrontierPoints = markowitzFrontier(sc,
+    sampledRetsCov,
+    avgSampledRets,
+    min(randReturns),
+    max(randReturns),
+    100000)
+```
+
+And here we have our result, where the red dots represent the efficient frontier at various return levels.
+
+![random_portfolios](/Users/josecambronero/Projects/spark-timeseries/src/main/resources/rand_portfolios_with_frontier.png)
+
+ 
+## Real world example
+Now on to the real deal. We'll be using daily close prices from Yahoo finance to calculate daily returns. We take advantage of a script similar to the one used in [Advanced Analytics with Spark](https://github.com/sryza/aas), with some small changes. For the remainder of the blog post, we'll assume the data has been properly downloaded and any failed files have simply been removed (`wget -O` still creates an output file regardless of error). If you're interested in replicating the exact results found below, make sure you have the data.zip file in your main resources folder, and then simply call the `./get_all_symbols.sh` script. If the zip folder is not there, the script will proceed to download, but there is a chance the data doesn't exactly match that used in the experiment below.
+
+We initially collect our data into an `RDD[TimeSeries]` and convert into a `TimeSeriesRDD`, which provides timeseries-specific functionality. We will focus on a specific window of time, so we take advantage of the `slice` operation available on `TimeSeriesRDD`. 
+
+Our portfolio doesn't need to be invested in upwards of 2000 companies. we drop all but the first 200 assets, using a quick utility function that lazily takes `n` series. Note that in contrast to the usual `take` on an `RDD`, this function does not collect on the driver.
+
+```scala 
+  val seriesByFile: RDD[TimeSeries] = YahooParser.yahooFiles(dataPath, sc)
+
+  // Merge the series from individual files into a TimeSeriesRDD and just take closes
+  val start = seriesByFile.map(_.index.first).takeOrdered(1).head
+  val end = seriesByFile.map(_.index.last).top(1).head
+  val dtIndex = uniform(start, end, 1.businessDays)
+  val tsRdd = timeSeriesRDD(dtIndex, seriesByFile).filter(_._1.endsWith("csvClose"))
+  
+  // Only look at close prices during 2015
+  val startDate = nextBusinessDay(new DateTime("2015-1-1"))
+  val endDate = nextBusinessDay(new DateTime("2015-6-6"))
+  val recentRdd = tsRdd.slice(startDate, endDate)
+
+  // take only part of the universe for our portfolio (first X number of series)
+  // but don't collect it locally yet
+  val nAssets = 200
+  val reducedRdd = lazyTake(recentRdd, nAssets)
+```
+
+Values won't be available for every date in our time index so we fill in any missing values using a couple of strategies. Spark timeseries comes with a variety of value imputation strategies. Choosing between these strategies can some times by tricky, and depending on what data you are dealing with, the results of your analysis can vary. However, in this case, we take a simplistic approach and simply fill using a cubic spline (i.e. we fit a curved line using known points and then take the curve value for unknown points), and any remaining values are filled forward and then back.
+
+```scala
+  val filledRdd = reducedRdd.
+    fill("spline").
+    fill("previous").
+    fill("next")
+```
+
+Once we have filled prices, we calculate daily returns using the `TimeSeriesRDD` method `price2ret`, which calculates single-period returns for a given series.
+
+## Real world realities: Data needs to get scrubbed 
+The truth of the world is that it is a dirty dirty place (for data). Data is never in the shape or conditions you expect or were told. You should probably think of data as one of those late night infomercials. Would it be nice to get in shape without actually doing any work? Yeah. Is it going to happen? Nope. Similarly, your data is never gonna be in shape unless you work for it.
+
+In our case, a quick plot of average returns per asset reveals that there is a clear outlier that we should investigate.
+
+![avg_returns_per_asset](/Users/josecambronero/Projects/spark-timeseries/src/main/resources/avg_returns_per_asset.png)
+
+Once we into the data (see the source code for details), we'll find that AMSC actually had a reverse stock split during our experiment's window. Checkout that price jump in the graph below, which shows the original (without imputation) price time series.
+
+During a [reverse stock split](https://en.wikipedia.org/wiki/Reverse_stock_split), a company takes their outstanding shares, and then issues a fraction of these back at a higher price, such that their market value (shares outstanding x price) remains constant. There are a variety of reasons for this, but we don't really care here. The fact is that this messed up our data. It is clear that in the real world, we would have to adjust our price information for all of these kind of events. In fact, this can be one of the most important parts of financial modeling. In blog world, however, we're just going to drop this series from our data set. But it is worth noting, had we not explored our data, we would have never noticed this issue! So much like the North Face motto says: *Never Stop Exploring*!
+
+![AMSC_raw_prices](/Users/josecambronero/Projects/spark-timeseries/src/main/resources/AMSC_raw_prices.png)
+
+
+## Our frontier
+Now that we have our data set cleaned up, we perform the same basic operations we performed with the simulated data. We generate 100k points between 0 and 4% expected returns, and then distribute the linear system solution by mapping over an `RDD` of these points. We elide the code here for brevity as little changes with respect to the prior example. 
+
+And here is our new graph:
+
+![final_frontier](/Users/josecambronero/Projects/spark-timeseries/src/main/resources/final_frontier.png)
+
+We hope you enjoyed exploring the funcionality of Spark timeseries.
